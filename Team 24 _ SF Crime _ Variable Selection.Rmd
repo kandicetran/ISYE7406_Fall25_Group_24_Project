@@ -1,0 +1,525 @@
+---
+title: "Team 24 Project"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+date: "Fall Semester 2025"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(tinytex.verbose = TRUE)
+```
+
+## Background
+
+The *SF_Crime_Processed.csv* dataset contains observations of police-reported crime incidents in San Francisco, CA, across 15 years. Each row in the dataset represents a crime report with details on the incident type, location, time, and various engineered features to support statistical learning and spatial modeling. The dataset includes a combination of categorical, numeric, temporal, and engineered predictor variables, all reflecting occurrences and patterns of crime in an urban environment.
+
+The dataset structure is outlined below, including the target variable and key features:
+
+- **CrimeSeverity** – *Target variable (Y):* Factored label indicating whether the incident is classified as "Low" or "High" severity, based on crime category.
+- **Category** – *Categorical:* Original SF crime incident category code (e.g., ASSAULT, BURGLARY) for each report.
+- **Descript** – *Categorical:* Short text description of the incident.
+- **DayOfWeek** – *Categorical:* Day of the week when the incident occurred (Sunday–Saturday).
+- **PdDistrict** – *Categorical:* Police district where the incident was reported.
+- **Resolution** – *Categorical:* Outcome or resolution status (e.g., ARREST, NONE).
+- **Date** – *Date:* Date of the incident.
+- **Time** – *Time (hh:mm):* Reported time of occurrence.
+- **Year** – *Integer:* Calendar year of the incident.
+- **Month** – *Integer:* Month (1–12) of the incident.
+- **Day** – *Integer:* Day of the month.
+- **Hour** – *Integer:* Hour of day (0–23).
+- **X** – *Numeric:* Longitude coordinate of the reported incident.
+- **Y** – *Numeric:* Latitude coordinate of the reported incident.
+- **X2** – *Numeric:* Squared longitude, for capturing spatial polynomial effects.
+- **Y2** – *Numeric:* Squared latitude, for capturing spatial polynomial effects.
+- **XY** – *Numeric:* Product of longitude and latitude (interaction effect).
+- **log_X** – *Numeric:* Log-transformed longitude.
+- **log_Y** – *Numeric:* Log-transformed latitude.
+- **Hour2** – *Integer:* Squared hour (captures periodic or nonlinear temporal patterns).
+- **IsWeekend** – *Binary (0/1):* Indicates if the incident occurred on the weekend.
+- **X_Hour** – *Numeric:* Interaction between longitude and hour.
+- **Y_Hour** – *Numeric:* Interaction between latitude and hour.
+- **HighCrime** – *Binary (0/1):* Alternate binary encoding for "High" severity incidents.
+
+**Assumption:**  
+The dataset consists of approximately 2 million crime incident reports from 2003 to May 2018, each with detailed attributes and derived features for comprehensive spatial-temporal and predictive modeling.
+
+*Source:* Data provided by City and County of San Francisco, DataSF (2025). “Police Department Incident Reports: Historical 2003 to May 2018.”
+
+## Part a: Prepare the Data:
+
+### Read Data
+```{r, message=F, warning=F}
+#Clear the Environment
+rm(list=ls())
+
+# Import the libraries
+#install.packages("pROC")
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(lubridate)
+  library(skimr)
+  library(forcats)
+  library(readr)
+  library(parallel)
+  library(doParallel)
+  library(viridis)
+  library(pROC)
+})
+
+df <- read_csv("Data/Police_Department_Incident_Reports__Historical_2003_to_May_2018_20250930.csv")
+head(df)
+
+```
+
+```{r, message=F, warning=F}
+
+# Set a seed for reproducibility
+set.seed(1234)
+
+# Register parallel backend for caret to speed up CV 
+num_cores <- detectCores() - 1 
+if(num_cores > 0) {
+   registerDoParallel(num_cores)
+   cat("Registered parallel backend with", num_cores, "cores.\n")
+} else {
+   cat("Less than 2 cores available. Can't perform parallel backend. \n")
+}
+
+```
+## Part b: Process the data
+
+```{r}
+#Load Data
+df <- read_csv("Data/Police_Department_Incident_Reports__Historical_2003_to_May_2018_20250930.csv")
+head(df)
+
+# Inspect columns 
+
+cat("\nHead of key columns (raw):\n")
+print(head(df %>% select(Date, Time, X, Y, Category, PdDistrict, DayOfWeek), 5))
+
+# Helper functions
+safe_trim_chr <- function(x) x %>% as.character() %>% stringr::str_squish()
+
+parse_date_multi <- function(x) {
+  d <- suppressWarnings(lubridate::mdy(x, quiet = TRUE))
+  idx_na <- is.na(d)
+  if (any(idx_na)) d[idx_na] <- suppressWarnings(lubridate::ymd(x[idx_na], quiet = TRUE))
+  idx_na <- is.na(d)
+  if (any(idx_na)) d[idx_na] <- suppressWarnings(lubridate::dmy(x[idx_na], quiet = TRUE))
+  d
+}
+
+normalize_time_string <- function(x) {
+  x <- gsub("\\s+", "", x)
+  x <- sub("^([0-9]):", "0\\1:", x)          
+  x <- ifelse(grepl("^\\d{1,2}$", x), paste0(x, ":00"), x) 
+  x
+}
+
+parse_time_multi <- function(x) {
+  x1 <- normalize_time_string(x)
+  t <- suppressWarnings(lubridate::hm(x1))
+  na1 <- is.na(t)
+  if (any(na1)) {
+    t2 <- suppressWarnings(lubridate::hms(x1[na1]))
+    t[na1] <- t2
+  }
+  t
+}
+
+# Remove empty time strings
+n0 <- nrow(df)
+df <- df %>%
+  mutate(
+    Date_raw = safe_trim_chr(Date),
+    Time_raw = safe_trim_chr(Time)
+  ) %>%
+  filter(!is.na(Date_raw), Date_raw != "", !is.na(Time_raw), Time_raw != "")
+cat(sprintf("\nRows after removing empty Date/Time: %d (was %d)\n", nrow(df), n0))
+
+# Standardize data
+df <- df %>%
+  mutate(
+    Category = stringr::str_to_title(safe_trim_chr(Category)),
+    Category_upper = stringr::str_to_upper(Category),
+    Descript = stringr::str_to_title(safe_trim_chr(Descript)),
+    PdDistrict = stringr::str_to_title(safe_trim_chr(PdDistrict)),
+    Resolution = stringr::str_to_title(safe_trim_chr(Resolution)),
+    DayOfWeek = stringr::str_to_title(safe_trim_chr(DayOfWeek)),
+
+    Date_parsed = parse_date_multi(Date_raw),
+    Time_parsed = parse_time_multi(Time_raw),
+
+    Year = lubridate::year(Date_parsed),
+    Month = lubridate::month(Date_parsed),
+    Day = lubridate::day(Date_parsed),
+    Hour = lubridate::hour(Time_parsed),
+
+    X = suppressWarnings(as.numeric(safe_trim_chr(X))),
+    Y = suppressWarnings(as.numeric(safe_trim_chr(Y)))
+  )
+
+# Convert factors
+df <- df %>%
+  mutate(
+    Descript = factor(Descript),
+    PdDistrict = factor(PdDistrict),
+    Resolution = factor(Resolution),
+    DayOfWeek = factor(DayOfWeek)
+  )
+
+# Severity mapping
+crime_severity_map <- c(
+  "KIDNAPPING" = "High",
+  "SEX OFFENSES, FORCIBLE" = "High",
+  "WEAPON LAWS" = "High",
+  "ARSON" = "High",
+  "ROBBERY" = "High",
+  "ASSAULT" = "High",
+  "BURGLARY" = "High",
+  "VEHICLE THEFT" = "High",
+  "SEX OFFENSES, NON FORCIBLE" = "High",
+  "DISORDERLY CONDUCT" = "High",
+  "SUSPICIOUS OCC" = "Low", "FORGERY/COUNTERFEITING" = "Low", "OTHER OFFENSES" = "Low",
+  "STOLEN PROPERTY" = "Low", "TRESPASS" = "Low", "MISSING PERSON" = "Low",
+  "WARRANTS" = "Low", "DRIVING UNDER THE INFLUENCE" = "Low", "TREA" = "Low",
+  "EMBEZZLEMENT" = "Low", "DRUNKENNESS" = "Low", "SECONDARY CODES" = "Low",
+  "RECOVERED VEHICLE" = "Low", "LARCENY/THEFT" = "Low", "SUICIDE" = "Low",
+  "FRAUD" = "Low", "PORNOGRAPHY/OBSCENE MAT" = "Low", "LOITERING" = "Low",
+  "BAD CHECKS" = "Low", "LIQUOR LAWS" = "Low", "GAMBLING" = "Low", "NON-CRIMINAL" = "Low",
+  "DRUG/NARCOTIC" = "Low", "PROSTITUTION" = "Low", "BRIBERY" = "Low",
+  "VANDALISM" = "Low", "EXTORTION" = "Low"
+)
+
+df <- df %>%
+  mutate(
+    CrimeSeverity = dplyr::recode(Category_upper, !!!crime_severity_map, .default = "Low"),
+    CrimeSeverity = factor(CrimeSeverity, levels = c("Low", "High"), ordered = TRUE)
+  )
+
+# Search for NAs
+cat("\nNAs after parsing:\n")
+print(colSums(is.na(df[, c("Date_parsed","Time_parsed","Year","Month","Day","Hour","X","Y")])))
+
+cat("\nHead of parsed Date/Time and coords:\n")
+print(head(df %>% select(Date_raw, Date_parsed, Time_raw, Time_parsed, X, Y), 5))
+
+#Remove rows with geo coordinates outside of San Francisco ie x = -120.5, y = 90
+rel_xmin <- -123.0; rel_xmax <- -122.0; rel_ymin <- 37.50; rel_ymax <- 38.10
+strict_xmin <- -122.52; strict_xmax <- -122.35; strict_ymin <- 37.70; strict_ymax <- 37.83
+
+df <- df %>%
+  mutate(
+    in_relaxed = !is.na(X) & !is.na(Y) &
+                 X >= rel_xmin & X <= rel_xmax & Y >= rel_ymin & Y <= rel_ymax,
+    in_strict = !is.na(X) & !is.na(Y) &
+                X >= strict_xmin & X <= strict_xmax & Y >= strict_ymin & Y <= strict_ymax
+  )
+
+cat(sprintf("\nRows within relaxed bounds: %d / %d", sum(df$in_relaxed, na.rm = TRUE), nrow(df)))
+cat(sprintf("\nRows within strict bounds:  %d / %d\n", sum(df$in_strict, na.rm = TRUE), nrow(df)))
+
+# How many valid temporal rows are there
+n1 <- nrow(df)
+df <- df %>%
+  filter(!is.na(Date_parsed), !is.na(Time_parsed), !is.na(Year), !is.na(Hour))
+cat(sprintf("Rows after keeping valid Date/Time: %d (was %d)\n", nrow(df), n1))
+
+# Troubleshooting - Apply spatial filter, but verify all rows aren't dropped/filtered out 
+n2 <- nrow(df)
+if (sum(df$in_strict, na.rm = TRUE) > 0) {
+  df <- df %>% filter(in_strict)
+  cat(sprintf("Rows after spatial filter: %d (was %d)\n", nrow(df), n2))
+} else if (sum(df$in_relaxed, na.rm = TRUE) > 0) {
+  warning("Strict bounds would drop all rows; will use relaxed bounds instead.")
+  df <- df %>% filter(in_relaxed)
+  cat(sprintf("Rows after relaxed spatial filter: %d (was %d)\n", nrow(df), n2))
+} else {
+  warning("No rows fall within relaxed bounds either. Skipping spatial filter; check X/Y columns.")
+}
+
+# DayOfWeek order 
+dow_levels <- c("Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday")
+present_levels <- intersect(dow_levels, levels(df$DayOfWeek))
+df <- df %>% mutate(DayOfWeek = forcats::fct_relevel(DayOfWeek, present_levels))
+
+# Remove temporary columns and duplicates
+drop_cols <- c("PdId", "IncidntNum", "Incident Code", "Address", "location", "data_loaded_at", "in_relaxed", "in_strict", "Category_upper")
+df_clean <- df %>%
+  mutate(Date = Date_parsed, Time = Time_parsed) %>%
+  select(-any_of(c("Date_parsed","Time_parsed","Date_raw","Time_raw", drop_cols))) %>%
+  distinct()
+
+cat(sprintf("\nClean rows: %d\n", nrow(df_clean)))
+cat("Remaining missingness (top 15 columns):\n")
+print(sort(colSums(is.na(df_clean)), decreasing = TRUE)[1:min(15, ncol(df_clean))])
+
+# Feature engineering - additional columns for non-linear spacial features, interaction terms, and log-transformed coordinates
+df_clean <- df_clean %>%
+  mutate(
+    Season = case_when(
+      Month %in% c(12,1,2) ~ "Winter",
+      Month %in% c(3,4,5) ~ "Spring",
+      Month %in% c(6,7,8) ~ "Summer",
+      Month %in% c(9,10,11) ~ "Fall",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("Winter","Spring","Summer","Fall")),
+    X2        = X^2,
+    Y2        = Y^2,
+    XY        = X * Y,
+    log_X     = log(abs(X) + 1),
+    log_Y     = log(abs(Y) + 1),
+    Hour2     = Hour^2,
+    IsWeekend = as.integer(DayOfWeek %in% c("Saturday","Sunday")),
+    X_Hour    = X * Hour,
+    Y_Hour    = Y * Hour,
+    HighCrime = as.integer(CrimeSeverity == "High")
+  )
+
+# Stratified sampling and preview
+cat("\nCounts by CrimeSeverity (post-clean):\n")
+print(table(df_clean$CrimeSeverity))
+
+set.seed(1234)
+target_n <- 10000
+df_sample <- df_clean %>%
+  group_by(CrimeSeverity) %>%
+  group_modify(~{
+    n_group <- nrow(.x)
+    if (n_group == 0) tibble()
+    else if (n_group < target_n) dplyr::slice_sample(.x, n = target_n, replace = TRUE)
+    else dplyr::slice_sample(.x, n = target_n, replace = FALSE)
+  }) %>%
+  ungroup()
+
+cat("\nSample head:\n")
+print(head(df_sample))
+cat("\nNAs in sample:\n")
+print(colSums(is.na(df_sample)))
+```
+```{r}
+#Save Cleaned Data
+write_csv(df_clean, "Data/SF_Crime_Processed.csv")
+
+cat("\nData processing complete! Cleaned data exported.\n")
+
+```
+## Variable Importance
+
+Assess which features in the dataset are important for analysis
+
+```{r}
+
+#Fit Baseline GLM on Original Dataset Features:
+orig_features <- c("X", "Y", "Hour", "Month", "Day", "IsWeekend")
+glm_orig <- glm(HighCrime ~ ., data = df_clean %>% select(all_of(orig_features), HighCrime), family = binomial)
+summary(glm_orig)
+aic_orig <- AIC(glm_orig)
+bic_orig <- BIC(glm_orig)
+cat("Baseline GLM (original features): AIC =", aic_orig, " BIC =", bic_orig, "\n")
+
+#Fit full GLM with Original and Engineered features;
+all_features <- c(
+  "X", "Y", "Hour", "Month", "Day", "IsWeekend",
+  "X2", "Y2", "XY", "log_X", "log_Y", "Hour2", "X_Hour", "Y_Hour"
+)
+glm_full <- glm(HighCrime ~ ., data = df_clean %>% select(all_of(all_features), HighCrime), family = binomial)
+summary(glm_full)
+aic_full <- AIC(glm_full)
+bic_full <- BIC(glm_full)
+cat("Full GLM (with engineered features): AIC =", aic_full, " BIC =", bic_full, "\n")
+
+#Compare predictive performance:
+
+# Split data: 70% train, 30% test
+set.seed(1234)
+row_ids <- seq_len(nrow(df_clean))
+train_idx <- sample(row_ids, 0.7 * length(row_ids))
+test_idx <- setdiff(row_ids, train_idx)
+train <- df_clean[train_idx, ]
+test <- df_clean[test_idx, ]
+
+# Fit models on train
+glm_orig_train <- glm(HighCrime ~ ., data = train %>% select(all_of(orig_features), HighCrime), family = binomial)
+glm_full_train <- glm(HighCrime ~ ., data = train %>% select(all_of(all_features), HighCrime), family = binomial)
+
+# Predict on test
+pred_orig <- predict(glm_orig_train, newdata = test, type = "response")
+pred_full <- predict(glm_full_train, newdata = test, type = "response")
+
+# Calculate AUC and accuracy
+auc_orig <- auc(test$HighCrime, pred_orig)
+auc_full <- auc(test$HighCrime, pred_full)
+
+acc_orig <- mean(round(pred_orig) == test$HighCrime)
+acc_full <- mean(round(pred_full) == test$HighCrime)
+
+cat("AUC (original):", auc_orig, "\nAUC (full):", auc_full, "\n")
+cat("Accuracy (original):", acc_orig, "\nAccuracy (full):", acc_full, "\n")
+
+```
+
+## Variable Selection - LASSO & Ensamble Methods
+
+Assess which features in the dataset are important for analysis using LASSO, Random Forest, and Ranger methods
+
+```{r}
+
+#install.packages("knitr")
+library("ranger")
+library("randomForest")
+library("glmnet")
+library("knitr")
+library("pROC")
+
+```
+
+```{r}
+
+#LASSO/Elastic Net Variable Selection on all features
+Xmat <- model.matrix(HighCrime ~ ., data=train %>% select(all_of(all_features), HighCrime))[, -1]
+yvec <- train$HighCrime
+
+cvfit <- cv.glmnet(Xmat, yvec, family="binomial", alpha=1)
+plot(cvfit)
+coef(cvfit, s="lambda.min")  # Nonzero coefficients = selected features
+
+# Predict on LASSO: Get the optimal lambda's coefficients and use predict()
+lasso_pred <- predict(cvfit, newx = model.matrix(HighCrime ~ ., test %>% select(all_of(all_features), HighCrime))[, -1], s = "lambda.min", type = "response")
+lasso_acc <- mean(round(lasso_pred) == test$HighCrime)
+
+lasso_auc <- auc(test$HighCrime, as.numeric(lasso_pred))
+
+```
+
+```{r}
+
+#Ranger
+rf_fit <- ranger(
+  formula = as.factor(HighCrime) ~ .,
+  data = train %>% select(all_of(all_features), HighCrime),
+  importance = "impurity",
+  num.trees = 150,
+  verbose = TRUE
+)
+
+# Collect important features from Random Forest
+rf_imp_ranger <- rf_fit$variable.importance
+rf_ranks_ranger <- rank(-rf_imp_ranger, ties.method = "first")
+rf_top_n <- min(10, length(rf_ranks_ranger))
+rf_features_ranger <- names(rf_ranks_ranger)[rf_ranks_ranger <= rf_top_n]
+print(rf_features_ranger)
+
+#Random Forest Feature Importance on a small subset
+tiny_train <- train %>% sample_n(300000)
+rf_test <- randomForest(as.factor(HighCrime) ~ .,  
+                data = tiny_train %>% select(all_of(all_features), HighCrime),
+                importance = TRUE,
+                ntree = 50,  
+                do.trace = TRUE)
+
+# Collect important features from Random Forest
+rf_imp_rf <- importance(rf_test)
+rf_ranks_rf <- rank(-rf_imp_rf[, "MeanDecreaseGini"], ties.method = "first")
+rf_top_n_rf <- min(10, length(rf_ranks_rf))
+rf_features_rf <- names(rf_ranks_rf)[rf_ranks_rf <= rf_top_n_rf]
+
+print(rf_features_rf)
+```
+
+```{r}
+# Predict on test set using rf_test
+rf_pred <- predict(rf_test, newdata = test %>% select(all_of(all_features)))
+rf_acc <- mean(as.integer(rf_pred)-1 == test$HighCrime)
+rf_auc <- auc(test$HighCrime, as.integer(rf_pred)-1)
+
+# Predict on test set using rf_fit (ranger)
+rf_ranger_pred <- predict(rf_fit, data = test %>% select(all_of(all_features)), type = "response")$predictions
+
+if(is.factor(rf_ranger_pred)) rf_ranger_pred <- as.integer(rf_ranger_pred) - 1
+
+rf_ranger_acc <- mean(rf_ranger_pred == test$HighCrime)
+rf_ranger_auc <- auc(test$HighCrime, rf_ranger_pred)
+```
+## Summary Tables from Variable Importance & Model
+```{r}
+# Troubleshooting
+#print(glm_signif_features)
+#print(lasso_features)
+#print(rf_features_rf)
+#print(rf_features_ranger)
+
+# Combine all features
+all_vars <- unique(unlist(list(
+  glm_signif_features,
+  lasso_features,
+  rf_features_rf,
+  rf_features_ranger
+)))
+
+#print(all_vars)
+
+# Create the summary table
+summary_tbl <- data.frame(
+  Feature = all_vars,
+  GLM_Significant = all_vars %in% glm_signif_features,
+  LASSO_Selected = all_vars %in% lasso_features,
+  RF_Top10 = all_vars %in% rf_features_rf,
+  Ranger_Top10 = all_vars %in% rf_features_ranger,
+  stringsAsFactors = FALSE
+)
+
+# Final Summary Table
+summary_tbl[] <- lapply(summary_tbl, function(x)
+  if (is.logical(x)) ifelse(x, "✔", "") else x
+)
+
+# Render the table
+kable(summary_tbl, caption = "Feature Selection/Importance Across All Methods")
+
+#Render a model fit summary table:
+model_fit_tbl <- data.frame(
+  Model = c(
+    "GLM (Original)",
+    "GLM (Original + Engineered)",
+    "LASSO Logistic",
+    "Random Forest (rf)",
+    "Random Forest (ranger)"
+  ),
+  AIC = c(
+    aic_orig,
+    aic_full,
+    NA,
+    NA,
+    NA
+  ),
+  BIC = c(
+    bic_orig,
+    bic_full,
+    NA,
+    NA,
+    NA
+  ),
+  Accuracy = round(c(
+    acc_orig,
+    acc_full,
+    lasso_acc,
+    rf_acc,
+    rf_ranger_acc
+  ), 4),
+  AUC = round(c(
+    auc_orig,
+    auc_full,
+    as.numeric(lasso_auc),
+    as.numeric(rf_auc),
+    as.numeric(rf_ranger_auc)
+  ), 4),
+  stringsAsFactors = FALSE
+)
+kable(model_fit_tbl, caption = "Model Fit and Predictive Comparison Summary")
+```
